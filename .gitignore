@@ -31,6 +31,7 @@ scripts/failure_screenshots/
 scripts/screenshot_*.png
 onwards-masai/scripts/screenshot_*.png
 onwards-masai/scripts/page_screenshot.png
+onwards-masai/scripts/captured/
 
 # macOS
 .DS_Store
