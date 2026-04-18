@@ -564,8 +564,8 @@ def main():
 
     with col2:
         with st.expander("Credentials", expanded=False):
-            email    = st.text_input("Email",    value="ravi.kiran@masaischool.com")
-            password = st.text_input("Password", value="AgentMarley@2", type="password")
+            email    = st.text_input("Email",    placeholder="your@email.com")
+            password = st.text_input("Password", placeholder="your password", type="password")
 
     # ── File upload ───────────────────────────────────────────────────────────
     uploaded = st.file_uploader("Upload CSV", type=["csv"])
