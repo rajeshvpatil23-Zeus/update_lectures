@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# Virtual envs
+.env
+.venv
+env/
+venv/
+
+# Browser session (never commit — contains cookies/auth data)
+browser_profile/
+onwards-masai/browser_profile/
+
+# Input / output files (contain data, not code)
+input/
+archive/
+runs/
+onwards-masai/input/
+onwards-masai/archive/
+onwards-masai/runs/
+
+# Debug artifacts and screenshots
+scripts/debug_artifacts/
+scripts/failure_screenshots/
+scripts/screenshot_*.png
+onwards-masai/scripts/screenshot_*.png
+onwards-masai/scripts/page_screenshot.png
+
+# macOS
+.DS_Store
