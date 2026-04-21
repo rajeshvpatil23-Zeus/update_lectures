@@ -15,15 +15,12 @@ venv/
 
 # Browser session (never commit — contains cookies/auth data)
 browser_profile/
-onwards-masai/browser_profile/
 
 # Input / output files (contain data, not code)
 input/
+logs/
 archive/
 runs/
-onwards-masai/input/
-onwards-masai/archive/
-onwards-masai/runs/
 
 # Debug artifacts and screenshots
 scripts/debug_artifacts/

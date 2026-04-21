@@ -1,27 +1,12 @@
 """
-update_lecture_v4.py  —  Bulk lecture updater (DOM-first, no current-value columns)
+update_lecture.py — Bulk lecture updater
 
-CSV schema (only these columns required):
+CSV columns (all required):
   lecture_url, updated_category, updated_module, updated_tags,
   updated_mandatory, updated_show_feedback
 
-Flow per lecture:
-  For each attempt (max 2):
-    1. Category      → read DOM; skip if already correct, else update
-    2. Module        → read DOM; skip if already correct, else update
-    3. Tags          → read DOM; skip if already correct, else clear + set
-    4. Mandatory     → read DOM toggle; skip if already correct, else click
-                       (toggle ON = mandatory; updated_mandatory=TRUE → toggle ON)
-    5. Show Feedback → read DOM toggle; skip if already correct, else click
-
-    Verify all 5 fields match desired values.
-    If all pass → proceed.
-    If any fail → retry from step 1 (max 2 total attempts).
-
-  Then: schedule defaults (always, outside retry loop)
-  Then: save
-
-  After run: input CSV is archived to archive/
+Place input CSV in ./input/ and run:
+  python update_lecture.py
 """
 
 import re
@@ -36,17 +21,29 @@ from playwright.sync_api import sync_playwright
 # ── Directories ───────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 INPUT_DIR   = os.path.join(BASE_DIR, "input")
-RUNS_DIR    = os.path.join(BASE_DIR, "runs")
-ARCHIVE_DIR = os.path.join(BASE_DIR, "archive")
+LOGS_DIR    = os.path.join(BASE_DIR, "logs")
+ARCHIVE_DIR = os.path.join(LOGS_DIR, "archive")
 
 os.makedirs(INPUT_DIR,   exist_ok=True)
-os.makedirs(RUNS_DIR,    exist_ok=True)
+os.makedirs(LOGS_DIR,    exist_ok=True)
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
+
+# ── Credentials ───────────────────────────────────────────────────────────────
+LOGIN_URL = "https://experience-admin.masaischool.com/"
+EMAIL     = "ravi.kiran@masaischool.com"
+PASSWORD  = "AgentMarley@2"
+
+MAX_ATTEMPTS = 2
+
+# ── Status labels ─────────────────────────────────────────────────────────────
+SKIPPED = "SKIPPED"
+CHANGED = "CHANGED"
+FAILED  = "FAILED"
+ERROR   = "ERROR"
 
 
 # ── Tee logger ────────────────────────────────────────────────────────────────
 class _Tee:
-    """Mirrors sys.stdout to a log file with per-line timestamps."""
     def __init__(self, filepath):
         self._file    = open(filepath, "w", buffering=1, encoding="utf-8")
         self._stdout  = sys.stdout
@@ -79,10 +76,10 @@ _tee: _Tee | None = None
 
 def _start_log(stem: str):
     global _tee
-    path = os.path.join(RUNS_DIR, f"{stem}.log")
+    path = os.path.join(LOGS_DIR, f"{stem}.log")
     _tee = _Tee(path)
     sys.stdout = _tee
-    print(f"Console log → {path}")
+    print(f"Log → {path}")
 
 
 def _stop_log():
@@ -93,22 +90,8 @@ def _stop_log():
         _tee = None
 
 
-# ── Credentials ───────────────────────────────────────────────────────────────
-LOGIN_URL = "https://experience-admin.masaischool.com/"
-EMAIL     = "ravi.kiran@masaischool.com"
-PASSWORD  = "AgentMarley@2"
-
-MAX_ATTEMPTS = 2
-
-# ── Status labels ─────────────────────────────────────────────────────────────
-SKIPPED = "SKIPPED"
-CHANGED = "CHANGED"
-FAILED  = "FAILED"
-ERROR   = "ERROR"
-
-
 # ═════════════════════════════════════════════════════════════════════════════
-# Low-level helpers
+# Helpers
 # ═════════════════════════════════════════════════════════════════════════════
 
 def to_bool(val) -> bool:
@@ -119,21 +102,17 @@ def norm_tags(val) -> list[str]:
     return sorted(t.strip().lower() for t in str(val).split(",") if t.strip())
 
 
-# ── Page-ready wait ───────────────────────────────────────────────────────────
-
 def _wait_for_form(page):
-    """Block until the lecture edit form is fully rendered (Edit Lecture button visible)."""
     try:
         page.wait_for_selector('button:has-text("Edit Lecture")', state="visible", timeout=15_000)
     except Exception:
         pass
-    page.wait_for_timeout(400)  # brief extra settle
+    page.wait_for_timeout(400)
 
 
 # ── Dropdowns (Category / Module) ────────────────────────────────────────────
 
 def _click_dropdown_input(page, label: str):
-    """Click the react-select input near a label using JS proximity search."""
     clicked = page.evaluate("""(labelText) => {
         const labels = [...document.querySelectorAll('label')];
         const lbl = labels.find(l =>
@@ -157,12 +136,10 @@ def _apply_dropdown(page, label: str, value) -> str:
     try:
         page.keyboard.press("Escape")
         page.wait_for_timeout(150)
-
         _click_dropdown_input(page, label)
         page.wait_for_timeout(300)
         page.keyboard.type(str(value), delay=50)
         page.wait_for_timeout(500)
-
         option = page.locator(".react-select__option").first
         try:
             if option.is_visible(timeout=1_000):
@@ -171,7 +148,6 @@ def _apply_dropdown(page, label: str, value) -> str:
                 page.keyboard.press("Enter")
         except Exception:
             page.keyboard.press("Enter")
-
         page.wait_for_timeout(300)
         return CHANGED
     except Exception as e:
@@ -181,7 +157,6 @@ def _apply_dropdown(page, label: str, value) -> str:
 
 
 def _read_dropdown(page, label: str) -> str:
-    """Read the displayed react-select value near a label (checks label + parent + grandparent)."""
     try:
         return page.evaluate("""(labelText) => {
             const labels = [...document.querySelectorAll('label')];
@@ -203,12 +178,9 @@ def _read_dropdown(page, label: str) -> str:
 # ── Tags ──────────────────────────────────────────────────────────────────────
 
 def _read_tags(page) -> list[str]:
-    """Read all current tag labels from the first multi-value react-select (Tags)."""
     try:
         return page.evaluate("""() => {
-            const container = document.querySelector(
-                '.react-select__value-container--is-multi'
-            );
+            const container = document.querySelector('.react-select__value-container--is-multi');
             if (!container) return [];
             return [...container.querySelectorAll('.react-select__multi-value__label')]
                 .map(el => el.textContent.trim().toLowerCase());
@@ -218,17 +190,10 @@ def _read_tags(page) -> list[str]:
 
 
 def _clear_tags(page):
-    """
-    Clear all tags via the × clear-all button using JS querySelector so we
-    always target the FIRST --is-multi container (Tags), not schedule selects.
-    Presses Escape first to close any leftover open dropdown menu.
-    """
     page.keyboard.press("Escape")
     page.wait_for_timeout(150)
     cleared = page.evaluate("""() => {
-        const container = document.querySelector(
-            '.react-select__value-container--is-multi'
-        );
+        const container = document.querySelector('.react-select__value-container--is-multi');
         if (!container) return false;
         const control  = container.parentElement;
         const clearBtn = control && control.querySelector('.react-select__clear-indicator');
@@ -242,7 +207,6 @@ def _clear_tags(page):
 
 
 def _add_tags(page, tags: list[str]) -> list[str]:
-    """Add tags one-by-one. Returns list of any that failed."""
     input_container = page.locator(
         ".react-select__value-container--is-multi > .react-select__input-container"
     ).first
@@ -271,13 +235,10 @@ def _add_tags(page, tags: list[str]) -> list[str]:
 # ── Toggles ───────────────────────────────────────────────────────────────────
 
 def _read_mandatory(page) -> bool | None:
-    """Read the Mandatory/Optional checkbox state scoped to its label."""
     try:
         return page.evaluate("""() => {
             const labels = [...document.querySelectorAll('label')];
-            const lbl = labels.find(l =>
-                /mandatory|optional/i.test(l.textContent)
-            );
+            const lbl = labels.find(l => /mandatory|optional/i.test(l.textContent));
             if (!lbl) return null;
             const cb = lbl.querySelector('input[type="checkbox"]');
             return cb ? cb.checked : null;
@@ -328,10 +289,7 @@ def _set_schedule_defaults(page) -> str:
     try:
         page.keyboard.press("Escape")
         page.wait_for_timeout(150)
-        page.wait_for_selector(
-            "div:nth-child(3) > .p-4 > .grid",
-            state="visible", timeout=10_000
-        )
+        page.wait_for_selector("div:nth-child(3) > .p-4 > .grid", state="visible", timeout=10_000)
         grid = page.locator("div:nth-child(3) > .p-4 > .grid")
         _clear_and_select(page, grid.locator("label").nth(0), "test group",  "Test Group")
         _clear_and_select(page, grid.locator("label").nth(1), "topic_001",   "topic_001")
@@ -343,17 +301,12 @@ def _set_schedule_defaults(page) -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Field apply + verify  (DOM-first: read current state, skip if already correct)
+# Field apply + verify
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _apply_all(page, row) -> dict:
-    """
-    Run steps 1-5 in order. Reads current DOM state for each field and skips
-    if already correct. Returns a status dict for this attempt.
-    """
     s = {}
 
-    # 1. Category
     cat_des = str(row.get("updated_category", "")).strip().lower()
     cat_dom = _read_dropdown(page, "Category")
     if cat_dom == cat_des:
@@ -363,7 +316,6 @@ def _apply_all(page, row) -> dict:
         print(f"  1. Category  → UPDATE '{cat_dom}' → '{cat_des}'")
         s["category"] = _apply_dropdown(page, "Category", row.get("updated_category"))
 
-    # 2. Module
     mod_des = str(row.get("updated_module", "")).strip().lower()
     mod_dom = _read_dropdown(page, "Module")
     if mod_dom == mod_des:
@@ -373,7 +325,6 @@ def _apply_all(page, row) -> dict:
         print(f"  2. Module    → UPDATE '{mod_dom}' → '{mod_des}'")
         s["module"] = _apply_dropdown(page, "Module", row.get("updated_module"))
 
-    # 3. Tags — read DOM, only clear+set if different
     desired_tags = norm_tags(row.get("updated_tags", ""))
     current_tags = sorted(_read_tags(page))
     if current_tags == desired_tags:
@@ -383,16 +334,9 @@ def _apply_all(page, row) -> dict:
         print(f"  3. Tags      → CLEAR + SET {desired_tags}")
         _clear_tags(page)
         page.wait_for_timeout(200)
-        if desired_tags:
-            failed = _add_tags(page, desired_tags)
-            s["tags"] = FAILED if failed else CHANGED
-        else:
-            s["tags"] = CHANGED
+        failed = _add_tags(page, desired_tags) if desired_tags else []
+        s["tags"] = FAILED if failed else CHANGED
 
-    # 4. Mandatory — read DOM toggle, compare with desired
-    #    Toggle ON = mandatory session.
-    #    updated_mandatory=TRUE  → toggle should be ON  (checked=True)
-    #    updated_mandatory=FALSE → toggle should be OFF (checked=False)
     desired_toggle = to_bool(row.get("updated_mandatory", ""))
     current_dom    = _read_mandatory(page)
     if current_dom is None:
@@ -406,7 +350,6 @@ def _apply_all(page, row) -> dict:
         _click_mandatory(page)
         s["mandatory"] = CHANGED
 
-    # 5. Show Feedback — read DOM toggle, compare with desired
     fb_des     = to_bool(row.get("updated_show_feedback", ""))
     current_fb = _read_show_feedback(page)
     if current_fb is None:
@@ -424,13 +367,8 @@ def _apply_all(page, row) -> dict:
 
 
 def _verify_all(page, row) -> dict:
-    """
-    Verify each field matches the desired value in the DOM.
-    Returns {field: True/False}.
-    """
     results = {}
 
-    # 1. Category
     cat_des = str(row.get("updated_category", "")).strip().lower()
     cat_dom = _read_dropdown(page, "Category")
     if not cat_dom:
@@ -441,7 +379,6 @@ def _verify_all(page, row) -> dict:
         if not results["category"]:
             print(f"     [VERIFY FAIL] Category: dom='{cat_dom}' want='{cat_des}'")
 
-    # 2. Module
     mod_des = str(row.get("updated_module", "")).strip().lower()
     mod_dom = _read_dropdown(page, "Module")
     if not mod_dom:
@@ -452,15 +389,12 @@ def _verify_all(page, row) -> dict:
         if not results["module"]:
             print(f"     [VERIFY FAIL] Module: dom='{mod_dom}' want='{mod_des}'")
 
-    # 3. Tags
     desired_tags = norm_tags(row.get("updated_tags", ""))
     current_tags = sorted(_read_tags(page))
     results["tags"] = (current_tags == desired_tags)
     if not results["tags"]:
         print(f"     [VERIFY FAIL] Tags: dom={current_tags} want={desired_tags}")
 
-    # 4. Mandatory
-    #    updated_mandatory=TRUE → toggle ON, updated_mandatory=FALSE → toggle OFF
     desired_toggle = to_bool(row.get("updated_mandatory", ""))
     opt_dom        = _read_mandatory(page)
     if opt_dom is None:
@@ -471,7 +405,6 @@ def _verify_all(page, row) -> dict:
         if not results["mandatory"]:
             print(f"     [VERIFY FAIL] Mandatory: dom={opt_dom} want={desired_toggle}")
 
-    # 5. Show Feedback
     fb_des = to_bool(row.get("updated_show_feedback", ""))
     fb_dom = _read_show_feedback(page)
     if fb_dom is None:
@@ -486,7 +419,7 @@ def _verify_all(page, row) -> dict:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Main lecture processor
+# Per-lecture processor
 # ═════════════════════════════════════════════════════════════════════════════
 
 def process_lecture(page, row) -> dict:
@@ -521,7 +454,7 @@ def process_lecture(page, row) -> dict:
         statuses.update(field_statuses)
 
         print(f"\n  Verifying (attempt {attempt}/{MAX_ATTEMPTS})...")
-        verification = _verify_all(page, row)
+        verification  = _verify_all(page, row)
         failed_fields = [f for f, ok in verification.items() if not ok]
 
         if not failed_fields:
@@ -536,11 +469,9 @@ def process_lecture(page, row) -> dict:
             statuses["notes"] = f"Verification failed after {MAX_ATTEMPTS} attempts: {failed_fields}"
             print(f"  [GIVE UP] Max attempts reached. Proceeding to save anyway.")
 
-    # Schedule defaults (always, outside retry loop)
     print(f"\n  Setting schedule defaults...")
     statuses["schedule"] = _set_schedule_defaults(page)
 
-    # Save
     try:
         page.get_by_role("button", name="Edit Lecture").click()
         page.wait_for_timeout(500)
@@ -562,19 +493,19 @@ def run():
     csv_files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.csv")))
 
     if not csv_files:
-        print(f"[ERROR] No CSV files found in {INPUT_DIR}")
-        print("Place your input CSV file(s) in the 'input/' folder and re-run.")
+        print(f"[ERROR] No CSV files found in {INPUT_DIR}/")
+        print("Place your input CSV in the input/ folder and re-run.")
         return
 
-    print(f"Found {len(csv_files)} CSV file(s) in input/:")
+    print(f"Found {len(csv_files)} CSV file(s):")
     for i, f in enumerate(csv_files):
         print(f"  [{i}] {os.path.basename(f)}")
 
     if len(csv_files) == 1:
         chosen = csv_files[0]
-        print(f"\nAuto-selecting: {os.path.basename(chosen)}")
+        print(f"Auto-selecting: {os.path.basename(chosen)}")
     else:
-        idx = input("\nEnter the number of the file to process: ").strip()
+        idx = input("\nEnter file number: ").strip()
         try:
             chosen = csv_files[int(idx)]
         except (ValueError, IndexError):
@@ -587,10 +518,7 @@ def run():
 
     _start_log(log_stem)
 
-    print(f"\nLoading: {chosen}")
     df = pd.read_csv(chosen)
-
-    # Validate required columns
     required = {"lecture_url", "updated_category", "updated_module",
                 "updated_tags", "updated_mandatory", "updated_show_feedback"}
     missing = required - set(df.columns)
@@ -608,32 +536,29 @@ def run():
         context = browser.new_context()
         page    = context.new_page()
 
-        # Login — auto-login using stored credentials; falls back to manual if it fails
         print("Attempting auto-login...")
         try:
             page.goto(LOGIN_URL)
             page.wait_for_load_state("networkidle")
-            page.get_by_role("textbox", name="Your email").click()
             page.get_by_role("textbox", name="Your email").fill(EMAIL)
             page.get_by_role("textbox", name="Your email").press("Tab")
             page.get_by_role("textbox", name="Your password").fill(PASSWORD)
-            page.locator("svg").click()  # reveal password field
+            page.locator("svg").click()
             page.get_by_role("button", name="Sign In").click()
             page.wait_for_load_state("networkidle", timeout=20_000)
             if "login" in page.url.lower() or page.url.rstrip("/") == LOGIN_URL.rstrip("/"):
-                raise Exception(f"Still on login page after Sign In: {page.url}")
+                raise Exception(f"Still on login page: {page.url}")
             print("Logged in. Starting lecture updates...\n")
         except Exception as login_err:
             print(f"[WARN] Auto-login failed: {login_err}")
-            print("Please log in manually in the browser window that just opened.")
-            input("Press ENTER here once you are logged in and on the dashboard... ")
+            input("Please log in manually, then press ENTER... ")
             page.wait_for_load_state("networkidle", timeout=20_000)
-            print("Resuming. Starting lecture updates...\n")
+            print("Resuming...\n")
 
         for i, row in df.iterrows():
             url = row["lecture_url"]
             print(f"{'─'*60}")
-            print(f"[{i + 1}/{len(df)}] {url}")
+            print(f"[{i+1}/{len(df)}] {url}")
             try:
                 statuses = process_lecture(page, row)
             except Exception as e:
@@ -644,37 +569,45 @@ def run():
                 statuses["lecture_url"] = url
                 statuses["attempts"]    = 0
                 statuses["notes"]       = str(e)
-
             all_statuses.append(statuses)
             print()
 
         browser.close()
 
-    # Write CSV report to runs/
-    csv_path = os.path.join(RUNS_DIR, f"{log_stem}.csv")
+    csv_path = os.path.join(LOGS_DIR, f"{log_stem}.csv")
     pd.DataFrame(all_statuses).to_csv(csv_path, index=False)
     print(f"\nCSV report  → {csv_path}")
 
-    # Archive the input CSV
-    archive_dest = os.path.join(ARCHIVE_DIR, f"{base}_{timestamp}.csv")
-    shutil.copy2(chosen, archive_dest)
-    print(f"Input archived → {archive_dest}")
+    dest = os.path.join(ARCHIVE_DIR, f"{base}_{timestamp}.csv")
+    shutil.copy2(chosen, dest)
+    print(f"Input archived → {dest}")
 
-    # Summary
     df_log = pd.DataFrame(all_statuses)
     print("\n══ Summary ══════════════════════════════════════════════")
     for col in ["category", "module", "tags", "mandatory", "show_feedback", "schedule", "save"]:
         if col in df_log.columns:
             print(f"  {col:20s}: {df_log[col].value_counts().to_dict()}")
-    total_failed = sum(
-        1 for s in all_statuses
-        if any(v == FAILED for k, v in s.items()
-               if k not in ("save", "schedule", "notes", "lecture_url", "attempts"))
-    )
-    print(f"\n  Lectures with field failures: {total_failed}/{len(all_statuses)}")
+
+    skip_keys = {"notes", "lecture_url", "attempts"}
+    failed = [s for s in all_statuses
+              if any(v in (FAILED, ERROR) for k, v in s.items() if k not in skip_keys)]
+    print(f"\n  Lectures with failures/errors: {len(failed)}/{len(all_statuses)}")
+
+    if failed:
+        print("\n  ── Failed / Error lecture IDs ────────────────────────")
+        for s in failed:
+            url    = s.get("lecture_url", "")
+            lec_id = url.split("id=")[-1] if "id=" in url else url
+            bad    = {k: v for k, v in s.items() if k not in skip_keys and v in (FAILED, ERROR)}
+            note   = s.get("notes", "")
+            line   = f"    [{lec_id}]  {bad}"
+            if note:
+                line += f"  — {note}"
+            print(line)
+        print("  ─────────────────────────────────────────────────────")
+
     print("═════════════════════════════════════════════════════════")
     print("Done.")
-
     _stop_log()
 
 
