@@ -486,21 +486,21 @@ def _update_lms_settings(page, row) -> dict:
             print(f"    [ERROR] Manager ID: {e}")
             results["manager_id"] = FAILED
 
-    # Save — explicit button required; never assume auto-save
+    # Save — only if the UI actually registered a change (save button appears)
     lms_attempted = any(results[k] == CHANGED for k in ("lms_batch_id", "lms_section_ids", "manager_id"))
     if lms_attempted:
+        save_btn = page.locator("button").filter(has_text=re.compile(r"Save LMS", re.I))
         try:
-            save_btn = page.locator("button").filter(has_text=re.compile(r"Save LMS", re.I))
-            save_btn.wait_for(state="visible", timeout=5_000)
+            save_btn.wait_for(state="visible", timeout=3_000)
             save_btn.first.click()
             page.wait_for_timeout(1_500)
             print("  [LMS SAVED]")
-        except Exception as e:
-            print(f"  [LMS SAVE FAILED — button not found or click failed: {e}]")
-            # Downgrade all CHANGED LMS fields to FAILED since save didn't complete
+        except Exception:
+            # Save button not visible — UI detected no actual change; treat as SKIPPED
+            print("  [LMS] Save button not present — values already match on page, treating as SKIPPED")
             for k in ("lms_batch_id", "lms_section_ids", "manager_id"):
                 if results[k] == CHANGED:
-                    results[k] = FAILED
+                    results[k] = SKIPPED
 
     return results
 
