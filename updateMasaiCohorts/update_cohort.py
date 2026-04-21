@@ -305,17 +305,38 @@ def _update_lms_settings(page, row) -> dict:
     if lms_batch:
         print(f"  LMS Batch ID → '{lms_batch}'")
         try:
-            page.locator(".lms-batch-dropdown button").click()
-            page.wait_for_timeout(600)
+            # Open dropdown — try the wrapper div first, fall back to any trigger button near "LMS Batch" text
+            try:
+                page.locator(".lms-batch-dropdown button").first.click()
+            except Exception:
+                page.locator("div, section").filter(
+                    has=page.locator("text=/LMS Batch/i")
+                ).get_by_role("button").first.click()
+            page.wait_for_timeout(800)
+
             search = page.get_by_placeholder("Search batches...")
-            search.wait_for(state="visible", timeout=6_000)
+            search.wait_for(state="visible", timeout=8_000)
             search.fill(lms_batch)
-            page.wait_for_timeout(1_000)
-            page.get_by_role("button").filter(
+            page.wait_for_timeout(1_200)
+
+            candidate = page.get_by_role("button").filter(
                 has_text=re.compile(re.escape(lms_batch), re.I)
-            ).first.click()
-            page.wait_for_timeout(600)
-            results["lms_batch_id"] = CHANGED
+            ).first
+            candidate.wait_for(state="visible", timeout=6_000)
+            candidate.click()
+            page.wait_for_timeout(800)
+
+            # Verify: search box should be gone (dropdown closed) or the selected label is visible
+            selected_visible = page.locator(
+                f"text={lms_batch}"
+            ).count() > 0
+            if selected_visible:
+                print(f"    ✓ batch '{lms_batch}' selected")
+                results["lms_batch_id"] = CHANGED
+            else:
+                print(f"    [WARN] batch selection could not be verified — marking FAILED")
+                results["lms_batch_id"] = FAILED
+
         except Exception as e:
             print(f"    [ERROR] LMS Batch ID: {e}")
             results["lms_batch_id"] = FAILED
@@ -347,7 +368,12 @@ def _update_lms_settings(page, row) -> dict:
                 return page.get_by_placeholder("Search sections...").is_visible()
 
             def _open_section_dropdown():
-                page.locator(".lms-section-dropdown button").first.click()
+                try:
+                    page.locator(".lms-section-dropdown button").first.click()
+                except Exception:
+                    page.locator("div, section").filter(
+                        has=page.locator("text=/LMS Section/i")
+                    ).get_by_role("button").first.click()
                 page.wait_for_timeout(1_000)
 
             def _chip_count() -> int:
@@ -460,17 +486,21 @@ def _update_lms_settings(page, row) -> dict:
             print(f"    [ERROR] Manager ID: {e}")
             results["manager_id"] = FAILED
 
-    try:
-        save_btn = page.locator("button", has_text="Save LMS Settings")
-        if save_btn.count() > 0 and save_btn.first.is_visible():
+    # Save — explicit button required; never assume auto-save
+    lms_attempted = any(results[k] == CHANGED for k in ("lms_batch_id", "lms_section_ids", "manager_id"))
+    if lms_attempted:
+        try:
+            save_btn = page.locator("button").filter(has_text=re.compile(r"Save LMS", re.I))
+            save_btn.wait_for(state="visible", timeout=5_000)
             save_btn.first.click()
-            page.wait_for_timeout(1_200)
-            print("  [LMS SAVED via button]")
-        else:
-            page.wait_for_timeout(800)
-            print("  [LMS auto-saved]")
-    except Exception as e:
-        print(f"  [LMS SAVE WARNING] {e}")
+            page.wait_for_timeout(1_500)
+            print("  [LMS SAVED]")
+        except Exception as e:
+            print(f"  [LMS SAVE FAILED — button not found or click failed: {e}]")
+            # Downgrade all CHANGED LMS fields to FAILED since save didn't complete
+            for k in ("lms_batch_id", "lms_section_ids", "manager_id"):
+                if results[k] == CHANGED:
+                    results[k] = FAILED
 
     return results
 
@@ -549,15 +579,10 @@ def process_cohort(page, row, base_url: str = BASE_URL) -> dict:
 def _launch_context(p, profile_dir: str):
     return p.chromium.launch_persistent_context(
         user_data_dir=profile_dir,
-        headless=True,
-        slow_mo=200,
-        viewport={"width": 1920, "height": 1080},
-        args=[
-            "--window-size=1920,1080",
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-        ],
+        headless=False,
+        slow_mo=300,
+        args=["--start-maximized"],
+        no_viewport=True,
     )
 
 
@@ -655,7 +680,7 @@ def _ensure_logged_in(login_url: str, profile_dir: str):
 
         input("Press ENTER to start updating cohorts... ")
         context.close()
-    print("Login confirmed. Opening headless browser for updates...\n")
+    print("Login confirmed. Opening browser for updates...\n")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
