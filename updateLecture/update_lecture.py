@@ -139,15 +139,29 @@ def _apply_dropdown(page, label: str, value) -> str:
         _click_dropdown_input(page, label)
         page.wait_for_timeout(300)
         page.keyboard.type(str(value), delay=50)
-        page.wait_for_timeout(500)
-        option = page.locator(".react-select__option").first
-        try:
-            if option.is_visible(timeout=1_000):
-                option.click()
-            else:
-                page.keyboard.press("Enter")
-        except Exception:
-            page.keyboard.press("Enter")
+        page.wait_for_timeout(600)
+
+        # Find option whose text matches the desired value (not just first option)
+        desired_lower = str(value).strip().lower()
+        options = page.locator(".react-select__option")
+        chosen = None
+        for i in range(options.count()):
+            opt = options.nth(i)
+            try:
+                if opt.is_visible(timeout=300) and opt.inner_text().strip().lower() == desired_lower:
+                    chosen = opt
+                    break
+            except Exception:
+                continue
+        if chosen is None and options.count() > 0:
+            chosen = options.first  # fall back to first if no exact match
+
+        if chosen and chosen.is_visible(timeout=500):
+            chosen.click()
+        else:
+            page.keyboard.press("Escape")
+            print(f"     [WARN] Dropdown '{label}': no option found for '{value}'")
+            return FAILED
         page.wait_for_timeout(300)
         return CHANGED
     except Exception as e:
@@ -216,15 +230,22 @@ def _add_tags(page, tags: list[str]) -> list[str]:
             input_container.click()
             page.wait_for_timeout(200)
             page.keyboard.type(tag, delay=50)
-            page.wait_for_timeout(400)
+            page.wait_for_timeout(600)
+
             option = page.locator(".react-select__option").first
             try:
-                if option.is_visible(timeout=800):
-                    option.click()
-                else:
-                    page.keyboard.press("Enter")
+                visible = option.is_visible(timeout=800)
             except Exception:
-                page.keyboard.press("Enter")
+                visible = False
+
+            if not visible:
+                print(f"    [WARN] Tag '{tag}': no option in dropdown — tag may not exist on platform")
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(200)
+                failed.append(tag)
+                continue
+
+            option.click()
             page.wait_for_timeout(250)
         except Exception as e:
             print(f"    [WARN] Could not add tag '{tag}': {e}")
@@ -450,6 +471,11 @@ def process_lecture(page, row) -> dict:
             page.wait_for_load_state("networkidle")
             _wait_for_form(page)
 
+        # Schedule defaults run FIRST each attempt — before field updates — so
+        # React re-renders triggered by dropdown interactions don't reset our changes
+        print(f"  Setting schedule defaults...")
+        statuses["schedule"] = _set_schedule_defaults(page)
+
         field_statuses = _apply_all(page, row)
         statuses.update(field_statuses)
 
@@ -468,9 +494,6 @@ def process_lecture(page, row) -> dict:
                 statuses[f] = FAILED
             statuses["notes"] = f"Verification failed after {MAX_ATTEMPTS} attempts: {failed_fields}"
             print(f"  [GIVE UP] Max attempts reached. Proceeding to save anyway.")
-
-    print(f"\n  Setting schedule defaults...")
-    statuses["schedule"] = _set_schedule_defaults(page)
 
     try:
         page.get_by_role("button", name="Edit Lecture").click()
