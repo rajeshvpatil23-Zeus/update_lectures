@@ -5,7 +5,7 @@ https://experience-admin.masaischool.com/Users/
 Expected CSV columns (flexible header matching):
   Name, email, Old Student code, new student code
 
-Only old student code and new student code are required.
+Preferred search key is email; old student code is used as fallback.
 """
 
 import os
@@ -179,15 +179,21 @@ def _find_search_box(page):
     return page.get_by_placeholder("Search by code, name, email & mobile...")
 
 
-def _open_edit_for_code(page, old_code: str):
+def _open_edit_for_user(page, email: str, old_code: str):
+    query = email.strip() if email.strip() else old_code.strip()
+    if not query:
+        raise ValueError("Both email and old student code are blank.")
+
     search = _find_search_box(page)
     search.wait_for(state="visible", timeout=12_000)
     search.click()
     search.fill("")
-    search.fill(old_code)
+    search.fill(query)
     page.wait_for_timeout(1200)
 
-    row = page.locator("tr").filter(has_text=re.compile(re.escape(old_code), re.I))
+    # Prefer exact row match by email when provided; otherwise use old student code.
+    row_key = email.strip() if email.strip() else old_code.strip()
+    row = page.locator("tr").filter(has_text=re.compile(re.escape(row_key), re.I))
     row.wait_for(state="visible", timeout=10_000)
     edit_btn = row.get_by_role("button", name=re.compile(r"edit", re.I)).first
     edit_btn.wait_for(state="visible", timeout=8_000)
@@ -204,8 +210,8 @@ def _set_username_and_update(page, old_code: str, new_code: str) -> str:
         "xpath=following::input[1]"
     ).first
     if username_input.count() == 0:
-        # Fallback by value matching old code
-        username_input = dialog.locator("input").filter(has_text=re.compile(re.escape(old_code), re.I)).first
+        # Fallback to first visible text input inside modal.
+        username_input = dialog.locator("input[type='text']").first
 
     username_input.wait_for(state="visible", timeout=8_000)
     current = username_input.input_value().strip()
@@ -242,14 +248,19 @@ def process_row(page, row: pd.Series) -> dict:
     result["notes"] = ""
 
     old_code = result["old_student_code"].strip()
+    email = result["email"].strip()
     new_code = result["new_student_code"].strip()
-    if not old_code or not new_code:
+    if not new_code or (not email and not old_code):
         result["username_update"] = FAILED
-        result["notes"] = "old/new student code missing in CSV row"
+        result["notes"] = "new student code missing, or both email and old student code are blank"
         return result
 
-    print(f"  Search old code: {old_code}")
-    _open_edit_for_code(page, old_code)
+    if email:
+        print(f"  Search email: {email}")
+    else:
+        print(f"  Search old code (fallback): {old_code}")
+
+    _open_edit_for_user(page, email=email, old_code=old_code)
     result["username_update"] = _set_username_and_update(page, old_code, new_code)
     return result
 
