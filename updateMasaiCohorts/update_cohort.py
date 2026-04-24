@@ -23,6 +23,17 @@ from playwright.sync_api import sync_playwright
 
 DEFAULT_PLATFORM = "masai"
 
+# ── Windows-friendly console encoding ──────────────────────────────────────────
+# This script prints box-drawing characters (e.g. "─"). On some Windows shells,
+# stdout defaults to a legacy codepage (cp1252/cp437) which raises UnicodeEncodeError.
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # ── Directories ────────────────────────────────────────────────────────────────
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 INPUT_DIR   = os.path.join(BASE_DIR, "input")
@@ -302,9 +313,77 @@ def _update_lms_settings(page, row) -> dict:
         print("  LMS Settings → SKIP (all blank in CSV)")
         return results
 
+    # Some cohorts already have the exact mapping. In that case the UI often doesn't
+    # show any "Save LMS" button because there are no changes. We must detect this
+    # and avoid clearing/re-adding (which can also make automation flaky).
+    def _normalize_chip(text: str) -> str:
+        t = (text or "").replace("\u00d7", " ").replace("×", " ").strip()
+        t = re.sub(r"\s+", " ", t)
+        return t
+
+    def _current_sections() -> list[str]:
+        try:
+            texts = page.locator("span.bg-green-50").all_inner_texts()
+            cleaned = []
+            for t in texts:
+                t = _normalize_chip(t)
+                if not t:
+                    continue
+                # chips sometimes contain extra lines or button glyphs; keep first meaningful token
+                first = next((p.strip() for p in t.splitlines() if p.strip()), "")
+                if first:
+                    cleaned.append(first)
+            return cleaned
+        except Exception:
+            return []
+
+    def _current_batch_text() -> str:
+        try:
+            # Usually the selected batch label is shown on the dropdown button itself.
+            t = page.locator(".lms-batch-dropdown button").first.inner_text().strip()
+            return t
+        except Exception:
+            try:
+                t = page.locator(".lms-batch-dropdown").inner_text().strip()
+                return t
+            except Exception:
+                return ""
+
+    def _current_manager() -> str:
+        try:
+            mgr = page.get_by_placeholder("Enter manager ID")
+            if mgr.count() > 0:
+                return mgr.first.input_value().strip()
+        except Exception:
+            pass
+        return ""
+
+    desired_sections_set = {s.strip() for s in sections if s.strip()}
+    current_sections_set = {s.strip() for s in _current_sections() if s.strip()}
+    current_batch_text   = _current_batch_text()
+    current_manager_val  = _current_manager()
+
+    batch_already_ok   = bool(lms_batch) and bool(current_batch_text) and re.search(re.escape(lms_batch), current_batch_text, re.I) is not None
+    sections_already_ok = bool(sections) and desired_sections_set == current_sections_set
+    manager_already_ok = bool(manager_id) and (current_manager_val == manager_id)
+
+    if (not lms_batch or batch_already_ok) and (not sections or sections_already_ok) and (not manager_id or manager_already_ok):
+        print("  LMS Settings → SKIP (already matches CSV; no save button expected)")
+        if lms_batch and batch_already_ok:
+            print(f"    ✓ LMS Batch already '{lms_batch}'")
+        if sections and sections_already_ok:
+            print(f"    ✓ LMS Sections already match ({len(desired_sections_set)} section(s))")
+        if manager_id and manager_already_ok:
+            print(f"    ✓ Manager ID already '{manager_id}'")
+        return results
+
     if lms_batch:
         print(f"  LMS Batch ID → '{lms_batch}'")
         try:
+            if batch_already_ok:
+                print(f"    SKIP (already '{lms_batch}')")
+                results["lms_batch_id"] = SKIPPED
+                raise StopIteration
             # Open dropdown — try the wrapper div first, fall back to any trigger button near "LMS Batch" text
             try:
                 page.locator(".lms-batch-dropdown button").first.click()
@@ -337,6 +416,8 @@ def _update_lms_settings(page, row) -> dict:
                 print(f"    [WARN] batch selection could not be verified — marking FAILED")
                 results["lms_batch_id"] = FAILED
 
+        except StopIteration:
+            pass
         except Exception as e:
             print(f"    [ERROR] LMS Batch ID: {e}")
             results["lms_batch_id"] = FAILED
@@ -350,6 +431,10 @@ def _update_lms_settings(page, row) -> dict:
         expected = len(sections)
         print(f"  LMS Section IDs → {expected} section(s): {sections}")
         try:
+            if sections_already_ok:
+                print("    SKIP (sections already match CSV)")
+                results["lms_section_ids"] = SKIPPED
+                raise StopIteration
             removed = 0
             for _ in range(50):
                 rm = page.locator("span.bg-green-50 button")
@@ -460,6 +545,8 @@ def _update_lms_settings(page, row) -> dict:
 
             results["lms_section_ids"] = CHANGED if ok_sections else FAILED
 
+        except StopIteration:
+            pass
         except Exception as e:
             print(f"    [ERROR] LMS Section IDs: {e}")
             results["lms_section_ids"] = FAILED
@@ -486,21 +573,63 @@ def _update_lms_settings(page, row) -> dict:
             print(f"    [ERROR] Manager ID: {e}")
             results["manager_id"] = FAILED
 
-    # Save — only if the UI actually registered a change (save button appears)
+    # Save — explicit button required; never assume auto-save
     lms_attempted = any(results[k] == CHANGED for k in ("lms_batch_id", "lms_section_ids", "manager_id"))
     if lms_attempted:
-        save_btn = page.locator("button").filter(has_text=re.compile(r"Save LMS", re.I))
         try:
-            save_btn.wait_for(state="visible", timeout=3_000)
-            save_btn.first.click()
+            # The UI label varies (e.g. "Save LMS", "Save", "Save Changes") and the button
+            # can be in a sticky footer or off-screen. Try a few robust selectors.
+            candidates = [
+                page.get_by_role("button", name=re.compile(r"^\s*Save\s+LMS\s*$", re.I)),
+                page.get_by_role("button", name=re.compile(r"Save\s+LMS", re.I)),
+                page.locator("button").filter(has_text=re.compile(r"Save\s+LMS", re.I)),
+                # Generic fallbacks – prefer "Save" buttons within the LMS section if present.
+                page.locator(".lms-batch-dropdown, .lms-section-dropdown, text=/LMS/i")
+                    .locator("xpath=ancestor-or-self::*[self::section or self::div][1]")
+                    .locator("button")
+                    .filter(has_text=re.compile(r"^\s*Save(\s+Changes)?\s*$", re.I)),
+                page.get_by_role("button", name=re.compile(r"^\s*Save(\s+Changes)?\s*$", re.I)),
+            ]
+
+            clicked = False
+            last_err = None
+            for loc in candidates:
+                try:
+                    loc.first.wait_for(state="visible", timeout=8_000)
+                    try:
+                        loc.first.scroll_into_view_if_needed(timeout=3_000)
+                    except Exception:
+                        pass
+                    loc.first.click(timeout=8_000)
+                    clicked = True
+                    break
+                except Exception as ex:
+                    last_err = ex
+                    continue
+
+            if not clicked:
+                raise RuntimeError(last_err or "Save button not found")
+
             page.wait_for_timeout(1_500)
             print("  [LMS SAVED]")
-        except Exception:
-            # Save button not visible — UI detected no actual change; treat as SKIPPED
-            print("  [LMS] Save button not present — values already match on page, treating as SKIPPED")
+        except Exception as e:
+            print(f"  [LMS SAVE FAILED — button not found or click failed: {e}]")
+            # Extra diagnostics: show any visible "save" buttons to help tune selectors.
+            try:
+                save_texts = (
+                    page.locator("button")
+                    .filter(has_text=re.compile(r"save", re.I))
+                    .all_inner_texts()
+                )
+                save_texts = [t.strip() for t in save_texts if t and t.strip()]
+                if save_texts:
+                    print(f"  [DEBUG] Save-like buttons on page: {save_texts[:20]}")
+            except Exception:
+                pass
+            # Downgrade all CHANGED LMS fields to FAILED since save didn't complete
             for k in ("lms_batch_id", "lms_section_ids", "manager_id"):
                 if results[k] == CHANGED:
-                    results[k] = SKIPPED
+                    results[k] = FAILED
 
     return results
 
@@ -668,17 +797,25 @@ def _ensure_logged_in(login_url: str, profile_dir: str):
         page.goto(login_url)
         page.wait_for_load_state("networkidle")
 
+        def _safe_input(prompt: str) -> str | None:
+            # Some runners/environments don't provide an interactive stdin.
+            try:
+                return input(prompt)
+            except EOFError:
+                print("\n[WARN] No interactive stdin available; cannot pause for ENTER.")
+                return None
+
         if (login_url.rstrip("/") in page.url.rstrip("/")
                 or "login" in page.url.lower()
                 or "signup" in page.url.lower()):
             print("Session expired — please log in with OTP in the browser window.")
-            input("Press ENTER once you are on the dashboard... ")
+            _safe_input("Press ENTER once you are on the dashboard... ")
             page.wait_for_load_state("networkidle", timeout=60_000)
             print(f"Logged in. URL: {page.url}")
         else:
             print(f"Session active. URL: {page.url}")
 
-        input("Press ENTER to start updating cohorts... ")
+        _safe_input("Press ENTER to start updating cohorts... ")
         context.close()
     print("Login confirmed. Opening browser for updates...\n")
 
