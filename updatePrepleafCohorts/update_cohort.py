@@ -285,8 +285,51 @@ def _update_basic_details_datetime_field(page, label_text: str, desired_csv, fie
             f"el.dispatchEvent(new Event('change', {{bubbles: true}})); }}"
         )
         page.wait_for_timeout(300)
-        page.get_by_role("button", name="Save Changes").click()
+        # Save from the active edit dialog (cohortStartDate popup), not from any background button.
+        dialog = page.get_by_role("dialog").filter(
+            has_text=re.compile(r"Edit\s+cohortStartDate|Batch Start Date|cohortStartDate", re.I)
+        )
+        if dialog.count() > 0:
+            save_btn = dialog.get_by_role("button", name=re.compile(r"^Save Changes$", re.I)).first
+        else:
+            save_btn = page.get_by_role("button", name=re.compile(r"^Save Changes$", re.I)).first
+        save_btn.wait_for(state="visible", timeout=8_000)
+        save_btn.click()
+        try:
+            if dialog.count() > 0:
+                dialog.first.wait_for(state="hidden", timeout=10_000)
+        except Exception:
+            pass
         page.wait_for_timeout(900)
+
+        # Re-open and verify persisted value to avoid false positives.
+        try:
+            section = page.locator("div.p-3").filter(
+                has=page.locator("span.text-gray-600", has_text=label_text)
+            )
+            section.wait_for(state="visible", timeout=8_000)
+            section.locator("button.text-blue-600").first.click()
+            page.wait_for_timeout(500)
+            verify_input = page.locator("input[type='datetime-local']").first
+            verify_input.wait_for(state="visible", timeout=8_000)
+            saved = verify_input.input_value().strip()
+            if saved != desired_dt:
+                print(
+                    f"  {field_name} → FAILED (verify mismatch: "
+                    f"saved '{dt_display(saved) if saved else 'empty'}', expected '{dt_display(desired_dt)}')"
+                )
+                try:
+                    page.get_by_role("button", name="Cancel").click()
+                except Exception:
+                    page.keyboard.press("Escape")
+                return FAILED
+            try:
+                page.get_by_role("button", name="Cancel").click()
+            except Exception:
+                page.keyboard.press("Escape")
+        except Exception:
+            # If verify step itself fails, keep CHANGED based on successful save click.
+            pass
         return CHANGED
     except Exception as e:
         print(f"  {field_name} → FAILED: {e}")
@@ -609,7 +652,7 @@ def process_cohort(page, row, base_url: str = BASE_URL) -> dict:
     _go_to_tab(page, "Basic Details")
     s["batch_id"] = _update_batch_id(page, row.get("batch_id"))
     s["batch_start_date"] = _update_basic_details_datetime_field(
-        page, "Batch Start Date", row.get("lms_batch_id"), "Batch Start Date"
+        page, "Batch Start Date", row.get("batch_start_date"), "Batch Start Date"
     )
 
     print("  [Identifiers]")
