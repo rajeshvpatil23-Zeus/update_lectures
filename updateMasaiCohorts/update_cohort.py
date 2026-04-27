@@ -252,6 +252,65 @@ def _update_student_prefix(page, desired) -> str:
     return _update_labeled_field(page, "Student Prefix", desired, "Student Prefix")
 
 
+def _update_basic_details_datetime_field(page, label_text: str, desired_csv, field_name: str) -> str:
+    blank = is_empty(desired_csv)
+    desired_dt = None if blank else parse_dt(str(desired_csv).strip())
+
+    if blank:
+        print(f"  {field_name} → SKIP (blank in CSV)")
+        return SKIPPED
+    if not desired_dt:
+        print(f"  {field_name} → FAILED (cannot parse date '{desired_csv}')")
+        return FAILED
+
+    try:
+        section = page.locator("div.p-3").filter(
+            has=page.locator("span.text-gray-600", has_text=label_text)
+        )
+        section.wait_for(state="visible", timeout=8_000)
+        pencil = section.locator("button.text-blue-600")
+        pencil.wait_for(state="visible", timeout=8_000)
+        pencil.first.click()
+        page.wait_for_timeout(700)
+
+        dt_input = page.locator("input[type='datetime-local']").first
+        dt_input.wait_for(state="visible", timeout=8_000)
+        current = dt_input.input_value().strip()
+
+        if current == desired_dt:
+            print(f"  {field_name} → SKIP (already '{dt_display(current)}')")
+            try:
+                page.get_by_role("button", name="Cancel").click()
+            except Exception:
+                page.keyboard.press("Escape")
+            page.wait_for_timeout(400)
+            return SKIPPED
+
+        print(
+            f"  {field_name} → UPDATE "
+            f"'{dt_display(current) if current else 'empty'}' → '{dt_display(desired_dt)}'"
+        )
+        dt_input.evaluate(
+            f"el => {{ el.value = '{desired_dt}'; "
+            f"el.dispatchEvent(new Event('input', {{bubbles: true}})); "
+            f"el.dispatchEvent(new Event('change', {{bubbles: true}})); }}"
+        )
+        page.wait_for_timeout(300)
+        page.get_by_role("button", name="Save Changes").click()
+        page.wait_for_timeout(900)
+        return CHANGED
+    except Exception as e:
+        print(f"  {field_name} → FAILED: {e}")
+        try:
+            page.get_by_role("button", name="Cancel").click()
+        except Exception:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+        return FAILED
+
+
 # ── Date fields ────────────────────────────────────────────────────────────────
 def _update_date_field(page, row_label: str, desired_csv, field_name: str) -> str:
     blank      = is_empty(desired_csv)
@@ -678,6 +737,9 @@ def process_cohort(page, row, base_url: str = BASE_URL) -> dict:
     print("  [Basic Details]")
     _go_to_tab(page, "Basic Details")
     s["batch_id"] = _update_batch_id(page, row.get("batch_id"))
+    s["batch_start_date"] = _update_basic_details_datetime_field(
+        page, "Batch Start Date", row.get("batch_start_date"), "Batch Start Date"
+    )
 
     print("  [Identifiers]")
     _go_to_tab(page, "Identifiers")
@@ -688,9 +750,6 @@ def process_cohort(page, row, base_url: str = BASE_URL) -> dict:
     _go_to_tab(page, "Dates")
     s["foundation_starts"] = _update_date_field(
         page, "Foundation Starts", row.get("foundation_starts"), "Foundation Starts"
-    )
-    s["batch_start_date"] = _update_date_field(
-        page, "Batch Start Date", row.get("batch_start_date"), "Batch Start Date"
     )
 
     print("  [Course Onboarding]")
